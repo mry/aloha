@@ -1,54 +1,57 @@
-podTemplate(
-    inheritFrom: "maven", 
-    label: "myJenkins", 
-    cloud: "openshift", 
-    volumes: [
-        persistentVolumeClaim(claimName: "m2repo", mountPath: "/tmp/.m2")
-    ]) {
+#!/usr/bin/groovy
+@Library('github.com/fabric8io/fabric8-pipeline-library@master')
+def canaryVersion = "1.0.${env.BUILD_NUMBER}"
+def utils = new io.fabric8.Utils()
+def stashName = "buildpod.${env.JOB_NAME}.${env.BUILD_NUMBER}".replace('-', '_').replace('/', '_')
+def envStage = utils.environmentNamespace('stage')
+def envProd = utils.environmentNamespace('run')
 
-    node("myJenkins") {
+mavenNode {
+  checkout scm
+  if (utils.isCI()){
 
-        @Library('github.com/redhat-helloworld-msa/jenkins-library@master') _
-        
-        stage ('SCM checkout'){
-            echo 'Checking out git repository'
-            checkout scm
-        }
+    mavenCI{}
     
-        stage ('Maven build'){
-            echo 'Building project'
-            sh "mvn package"
-        }
-    
-        stage ('DEV - Image build'){
-            echo 'Building docker image and deploying to Dev'
-            buildApp('helloworld-msa-dev', "aloha")
-            echo "This is the build number: ${env.BUILD_NUMBER}"
-        }
-    
-        stage ('Automated tests'){
-            echo 'This stage simulates automated tests'
-            sh "mvn -B -Dmaven.test.failure.ignore verify"
-        }
-    
-        stage ('QA - Promote image'){
-            echo 'Deploying to QA'
-            promoteImage('helloworld-msa-dev', 'helloworld-msa-qa', 'aloha', 'latest')
-        }
-    
-        stage ('Wait for approval'){
-            input 'Approve to production?'
-        }
-    
-        stage ('PRD - Promote image'){
-            echo 'Deploying to production'
-            promoteImage('helloworld-msa-qa', 'helloworld-msa', 'aloha', env.BUILD_NUMBER)
-        }
+  } else if (utils.isCD()){
+    echo 'NOTE: running pipelines for the first time will take longer as build and base docker images are pulled onto the node'
+    container(name: 'maven') {
 
-        stage ('PRD - Canary Deploy'){
-            echo 'Performing a canary deployment'
-            canaryDeploy('helloworld-msa', 'aloha', env.BUILD_NUMBER)
+      stage('Build Release'){
+        mavenCanaryRelease {
+          version = canaryVersion
         }
+        //stash deployment manifests
+        stash includes: '**/*.yml', name: stashName
+      }
 
+      stage('Rollout to Stage'){
+        apply{
+          environment = envStage
+        }
+      }
     }
+  }
+}
+
+if (utils.isCD()){
+  node {
+    stage('Approve'){
+       approve {
+         room = null
+         version = canaryVersion
+         environment = 'Stage'
+       }
+     }
+  }
+
+  clientsNode{
+    container(name: 'clients') {
+      stage('Rollout to Run'){
+        unstash stashName
+        apply{
+          environment = envProd
+        }
+      }
+    }
+  }
 }
